@@ -2,6 +2,11 @@
 Taskade -> Google Drive sync (recent days only, cloud-safe version).
 Reads all secrets from environment variables.
 Designed to run on GitHub Actions.
+
+Logging policy:
+- No project names or filenames are ever printed.
+- Only counts and (on failure) exception type names are logged.
+- Safe for public repository.
 """
 
 import sys
@@ -9,6 +14,7 @@ import time
 import os
 import re
 import json
+from collections import Counter
 from datetime import datetime, timedelta
 
 import requests
@@ -201,8 +207,10 @@ def main():
 
     print(f"  Found {len(recent)} project(s) in date range.")
 
-    synced = 0
+    created = 0
+    updated = 0
     failed = 0
+    error_types = Counter()
 
     for proj_date, proj in recent:
         proj_id = proj["id"]
@@ -223,14 +231,23 @@ def main():
             action = upsert_file(
                 drive, filename, md.encode("utf-8"), existing_files
             )
-            print(f"  [{action}] {filename}")
-            synced += 1
+            if action == "created":
+                created += 1
+            else:
+                updated += 1
 
         except Exception as e:
-            print(f"  [FAIL] {proj_name}: {e}")
             failed += 1
+            error_types[type(e).__name__] += 1
 
-    print(f"\nDone. Synced: {synced}. Failed: {failed}.")
+    print(
+        f"\nDone. Created: {created}. Updated: {updated}. Failed: {failed}."
+    )
+    if error_types:
+        summary = ", ".join(
+            f"{name}={count}" for name, count in error_types.most_common()
+        )
+        print(f"Error types: {summary}")
 
     if failed > 0:
         sys.exit(1)
