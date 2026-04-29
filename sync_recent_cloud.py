@@ -21,6 +21,7 @@ import requests
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaInMemoryUpload
 
 # ============================================================
@@ -35,6 +36,28 @@ TASKADE_API = "https://www.taskade.com/api/v1"
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
 RECENT_DAYS = 5
+
+# Retry config for transient Drive errors
+DRIVE_RETRY_STATUSES = (429, 500, 502, 503, 504)
+DRIVE_RETRIES = 4
+DRIVE_RETRY_BASE = 1.0
+
+
+def drive_call(fn):
+    """Execute a Drive API call with exponential backoff on transient errors."""
+    for attempt in range(DRIVE_RETRIES + 1):
+        try:
+            return fn()
+        except HttpError as e:
+            status = getattr(e, "status_code", None)
+            if status is None:
+                resp = getattr(e, "resp", None)
+                status = getattr(resp, "status", None)
+            if status in DRIVE_RETRY_STATUSES and attempt < DRIVE_RETRIES:
+                time.sleep(DRIVE_RETRY_BASE * (2 ** attempt))
+                continue
+            raise
+
 
 # ============================================================
 # Taskade API
@@ -130,13 +153,19 @@ def upsert_file(drive, filename, content_bytes, existing_files):
     media = MediaInMemoryUpload(content_bytes, mimetype="text/markdown")
     file_id = existing_files.get(filename)
     if file_id:
-        drive.files().update(fileId=file_id, media_body=media).execute()
+        drive_call(
+            lambda: drive.files()
+            .update(fileId=file_id, media_body=media)
+            .execute()
+        )
         return "updated"
     else:
         meta = {"name": filename, "parents": [GDRIVE_FOLDER_ID]}
-        result = drive.files().create(
-            body=meta, media_body=media, fields="id"
-        ).execute()
+        result = drive_call(
+            lambda: drive.files()
+            .create(body=meta, media_body=media, fields="id")
+            .execute()
+        )
         existing_files[filename] = result["id"]
         return "created"
 
@@ -145,13 +174,18 @@ def list_existing_files(drive):
     files = {}
     page_token = None
     while True:
-        res = drive.files().list(
-            q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false",
-            fields="nextPageToken, files(id, name)",
-            spaces="drive",
-            pageSize=1000,
-            pageToken=page_token,
-        ).execute()
+        current_token = page_token
+        res = drive_call(
+            lambda: drive.files()
+            .list(
+                q=f"'{GDRIVE_FOLDER_ID}' in parents and trashed = false",
+                fields="nextPageToken, files(id, name)",
+                spaces="drive",
+                pageSize=1000,
+                pageToken=current_token,
+            )
+            .execute()
+        )
         for f in res.get("files", []):
             files[f["name"]] = f["id"]
         page_token = res.get("nextPageToken")
