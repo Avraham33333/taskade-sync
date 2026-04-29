@@ -116,6 +116,7 @@ def project_to_markdown(project, tasks):
 # Date parsing
 # ============================================================
 DATE_PATTERN = re.compile(r"^(\d{2})/(\d{2})/(\d{4})")
+DATE_FILENAME_PATTERN = re.compile(r"^(\d{2}_\d{2}_\d{4})")
 
 
 def parse_project_date(name):
@@ -149,25 +150,79 @@ def get_credentials():
     return creds
 
 
-def upsert_file(drive, filename, content_bytes, existing_files):
+def index_by_date_prefix(existing_files):
+    """Group existing files by their leading DD_MM_YYYY prefix.
+    Returns a dict mapping prefix -> list of (filename, file_id)."""
+    by_prefix = {}
+    for filename, file_id in existing_files.items():
+        m = DATE_FILENAME_PATTERN.match(filename)
+        if m:
+            prefix = m.group(1)
+            by_prefix.setdefault(prefix, []).append((filename, file_id))
+    return by_prefix
+
+
+def upsert_file(drive, filename, content_bytes, existing_files, by_prefix):
+    """Upsert a file, identifying existing files by date prefix (DD_MM_YYYY)
+    rather than exact filename. This way, renaming a Taskade project
+    (e.g., adding ' - cheat day' mid-day) updates and renames the existing
+    Drive file instead of creating a duplicate. If multiple files with the
+    same date prefix already exist, the canonical one is kept and updated;
+    the rest are moved to trash."""
     media = MediaInMemoryUpload(content_bytes, mimetype="text/markdown")
-    file_id = existing_files.get(filename)
-    if file_id:
-        drive_call(
-            lambda: drive.files()
-            .update(fileId=file_id, media_body=media)
-            .execute()
-        )
-        return "updated"
-    else:
+
+    m = DATE_FILENAME_PATTERN.match(filename)
+    prefix = m.group(1) if m else None
+    candidates = by_prefix.get(prefix, []) if prefix else []
+
+    if not candidates:
         meta = {"name": filename, "parents": [GDRIVE_FOLDER_ID]}
         result = drive_call(
             lambda: drive.files()
             .create(body=meta, media_body=media, fields="id")
             .execute()
         )
-        existing_files[filename] = result["id"]
+        new_id = result["id"]
+        existing_files[filename] = new_id
+        if prefix:
+            by_prefix.setdefault(prefix, []).append((filename, new_id))
         return "created"
+
+    chosen_filename, chosen_id = next(
+        ((n, i) for n, i in candidates if n == filename), candidates[0]
+    )
+
+    for other_name, other_id in candidates:
+        if other_id == chosen_id:
+            continue
+        drive_call(
+            lambda fid=other_id: drive.files()
+            .update(fileId=fid, body={"trashed": True})
+            .execute()
+        )
+        existing_files.pop(other_name, None)
+
+    if chosen_filename != filename:
+        drive_call(
+            lambda: drive.files()
+            .update(
+                fileId=chosen_id,
+                body={"name": filename},
+                media_body=media,
+            )
+            .execute()
+        )
+        existing_files.pop(chosen_filename, None)
+    else:
+        drive_call(
+            lambda: drive.files()
+            .update(fileId=chosen_id, media_body=media)
+            .execute()
+        )
+
+    existing_files[filename] = chosen_id
+    by_prefix[prefix] = [(filename, chosen_id)]
+    return "updated"
 
 
 def list_existing_files(drive):
@@ -220,6 +275,7 @@ def main():
     creds = get_credentials()
     drive = build("drive", "v3", credentials=creds, cache_discovery=False)
     existing_files = list_existing_files(drive)
+    by_prefix = index_by_date_prefix(existing_files)
 
     today = datetime.now().date()
     cutoff = today - timedelta(days=RECENT_DAYS - 1)
@@ -263,7 +319,7 @@ def main():
 
             md = project_to_markdown(project_data, tasks)
             action = upsert_file(
-                drive, filename, md.encode("utf-8"), existing_files
+                drive, filename, md.encode("utf-8"), existing_files, by_prefix
             )
             if action == "created":
                 created += 1
