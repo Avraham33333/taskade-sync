@@ -5,7 +5,13 @@ Designed to run on GitHub Actions.
 
 Logging policy:
 - No project names or filenames are ever printed.
-- Only counts and (on failure) exception type names are logged.
+- Failed projects are tagged with a stable 8-char SHA256 hash of the
+  project name. The hash leaks nothing about the underlying name; it
+  only allows correlating failures across runs and mapping a tag back
+  to a name LOCALLY on the developer machine.
+- Exception type, message, and traceback are printed to aid debugging.
+  RuntimeError messages from this script contain only opaque API
+  endpoints (no dates, no titles).
 - Safe for public repository.
 """
 
@@ -14,6 +20,8 @@ import time
 import os
 import re
 import json
+import hashlib
+import traceback
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -41,6 +49,11 @@ RECENT_DAYS = 5
 DRIVE_RETRY_STATUSES = (429, 500, 502, 503, 504)
 DRIVE_RETRIES = 4
 DRIVE_RETRY_BASE = 1.0
+
+
+def name_tag(name):
+    """Stable 8-char hash of a project name. Safe to log publicly."""
+    return hashlib.sha256(name.encode("utf-8")).hexdigest()[:8]
 
 
 def drive_call(fn):
@@ -302,10 +315,11 @@ def main():
     failed = 0
     error_types = Counter()
 
-    for proj_date, proj in recent:
+    for i, (proj_date, proj) in enumerate(recent, start=1):
         proj_id = proj["id"]
         proj_name = proj.get("name") or proj.get("title") or proj_id
         filename = safe_filename(proj_name) + ".md"
+        tag = name_tag(proj_name)
 
         try:
             project_data_resp = taskade_get(f"/projects/{proj_id}")
@@ -329,6 +343,12 @@ def main():
         except Exception as e:
             failed += 1
             error_types[type(e).__name__] += 1
+            print(
+                f"[FAIL] i={i}/{len(recent)} tag={tag} "
+                f"exc={type(e).__name__} msg={e!s}",
+                flush=True,
+            )
+            traceback.print_exc()
 
     print(
         f"\nDone. Created: {created}. Updated: {updated}. Failed: {failed}."
