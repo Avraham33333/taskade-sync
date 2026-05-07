@@ -83,14 +83,18 @@ taskade_headers = {
 
 def taskade_get(endpoint, params=None):
     url = f"{TASKADE_API}{endpoint}"
+    last_status = None
+    last_exc = None
     for attempt in range(8):
         try:
             r = requests.get(
                 url, headers=taskade_headers, params=params, timeout=30
             )
-        except requests.exceptions.RequestException:
+        except requests.exceptions.RequestException as e:
+            last_exc = type(e).__name__
             time.sleep(min(2 ** attempt, 60))
             continue
+        last_status = r.status_code
         if r.status_code == 429:
             wait = int(r.headers.get("Retry-After", 5))
             time.sleep(wait)
@@ -100,7 +104,10 @@ def taskade_get(endpoint, params=None):
             continue
         r.raise_for_status()
         return r.json()
-    raise RuntimeError(f"Failed after retries: {endpoint}")
+    raise RuntimeError(
+        f"Failed after retries: {endpoint} "
+        f"last_status={last_status} last_exc={last_exc}"
+    )
 
 
 def items_of(response):
