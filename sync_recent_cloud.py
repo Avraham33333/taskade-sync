@@ -20,6 +20,7 @@ import time
 import os
 import re
 import json
+import random
 import hashlib
 import traceback
 from collections import Counter
@@ -49,6 +50,10 @@ RECENT_DAYS = 5
 DRIVE_RETRY_STATUSES = (429, 500, 502, 503, 504)
 DRIVE_RETRIES = 4
 DRIVE_RETRY_BASE = 1.0
+
+# Retry config for Taskade API
+TASKADE_MAX_RETRIES = 8
+TASKADE_BACKOFF_CAP = 60.0
 
 
 def name_tag(name):
@@ -82,28 +87,52 @@ taskade_headers = {
 
 
 def taskade_get(endpoint, params=None):
+    """GET a Taskade endpoint with rate-limit-aware retry.
+
+    On 429, honors the Retry-After header (seconds). If the header is
+    missing or non-numeric, falls back to capped exponential backoff
+    with jitter. On 5xx, uses capped exponential backoff. On network
+    errors, also uses capped exponential backoff. Other 4xx are not
+    retried.
+    """
     url = f"{TASKADE_API}{endpoint}"
     last_status = None
     last_exc = None
-    for attempt in range(8):
+    backoff = 2.0
+    for attempt in range(TASKADE_MAX_RETRIES):
         try:
             r = requests.get(
                 url, headers=taskade_headers, params=params, timeout=30
             )
         except requests.exceptions.RequestException as e:
             last_exc = type(e).__name__
-            time.sleep(min(2 ** attempt, 60))
+            time.sleep(min(backoff + random.uniform(0, 1.0), TASKADE_BACKOFF_CAP))
+            backoff = min(backoff * 2, TASKADE_BACKOFF_CAP)
             continue
+
         last_status = r.status_code
+
+        if r.status_code == 200:
+            return r.json()
+
         if r.status_code == 429:
-            wait = int(r.headers.get("Retry-After", 5))
-            time.sleep(wait)
+            ra = r.headers.get("Retry-After", "")
+            if ra.isdigit():
+                sleep_s = int(ra) + random.uniform(0.5, 1.5)
+            else:
+                sleep_s = backoff + random.uniform(0, backoff * 0.5)
+                backoff = min(backoff * 2, TASKADE_BACKOFF_CAP)
+            time.sleep(min(sleep_s, TASKADE_BACKOFF_CAP))
             continue
-        if r.status_code in (500, 502, 503, 504):
-            time.sleep(min(2 ** attempt, 60))
+
+        if 500 <= r.status_code < 600:
+            time.sleep(min(backoff + random.uniform(0, 1.0), TASKADE_BACKOFF_CAP))
+            backoff = min(backoff * 2, TASKADE_BACKOFF_CAP)
             continue
+
+        # Other 4xx: do not retry.
         r.raise_for_status()
-        return r.json()
+
     raise RuntimeError(
         f"Failed after retries: {endpoint} "
         f"last_status={last_status} last_exc={last_exc}"
