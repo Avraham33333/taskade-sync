@@ -44,7 +44,7 @@ GOOGLE_TOKEN_JSON = os.environ.get("GOOGLE_TOKEN_JSON")
 TASKADE_API = "https://www.taskade.com/api/v1"
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 
-RECENT_DAYS = 5
+RECENT_DAYS = int(os.environ.get("RECENT_DAYS", "5"))
 
 # Retry config for transient Drive errors
 DRIVE_RETRY_STATUSES = (429, 500, 502, 503, 504)
